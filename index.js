@@ -1,155 +1,177 @@
+// topserp-no-cookie-server.js
 require('dotenv').config();
 const fs = require('fs');
 const path = require('path');
 const express = require('express');
 const cors = require('cors');
 const { v4: uuidv4 } = require('uuid');
-const tough = require('tough-cookie');
-const { wrapper } = require('axios-cookiejar-support');
-const axios = wrapper(require('axios'));
+const axios = require('axios');
+const cheerio = require('cheerio');
 const { URL } = require('url');
 
 const PORT = parseInt(process.env.PORT || '3000', 10);
-const COOKIES_FILE = process.env.COOKIES_FILE || path.join(__dirname, 'cookies.txt');
 const BASE = 'https://www.instagram.com';
 const IOS_BASE = 'https://i.instagram.com';
 const DEFAULT_X_IG_APP_ID = process.env.X_IG_APP_ID || '1217981644879628';
 const DEFAULT_UA = process.env.UA || 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120.0.0.0 Safari/537.36';
 const MOBILE_UA = process.env.MOBILE_UA || 'Instagram 219.0.0.12.117 Android (30/11; 420dpi; 1080x2340; samsung; SM-G981B; qcom; en_US)';
 
-const MAX_SESSIONS = parseInt(process.env.MAX_SESSIONS || '8', 10);
-const MAX_ATTEMPTS = parseInt(process.env.MAX_ATTEMPTS || '20', 10);
+const MAX_PUPPETEER_SCROLLS = parseInt(process.env.MAX_PUPPETEER_SCROLLS || '40', 10);
 const PAGINATION_DELAY_MS = parseInt(process.env.PAGINATION_DELAY_MS || '250', 10);
 const FALLBACK_PAGES = parseInt(process.env.FALLBACK_PAGES || '20', 10);
-const MAX_PUPPETEER_SCROLLS = parseInt(process.env.MAX_PUPPETEER_SCROLLS || '40', 10);
-const PER_SESSION_PAGES = parseInt(process.env.PER_SESSION_PAGES || '4', 10);
 
 const CACHE_DIR = path.join(__dirname, 'cache');
-const CACHE_MIN_SIZE = parseInt(process.env.CACHE_MIN_SIZE || '40', 10);
-const CACHE_PREFETCH_BATCH = parseInt(process.env.CACHE_PREFETCH_BATCH || '80', 10);
 const RECENT_MAX = parseInt(process.env.RECENT_MAX || '300', 10);
-const CACHE_TTL_MS = parseInt(process.env.CACHE_TTL_MS || String(1000 * 60 * 60 * 24), 10); // 24h
-
 const DEBUG = String(process.env.DEBUG || 'false').toLowerCase() === 'true';
+const DEEP_DEBUG = String(process.env.DEEP_DEBUG || 'true').toLowerCase() === 'true';
 
-function log(...args) { if (DEBUG) console.log('[DEBUG]', ...args); }
+function dbg(...args) { if (DEBUG || DEEP_DEBUG) console.log('[DBG]', ...args); }
+function dbgDeep(...args) { if (DEEP_DEBUG) console.log('[DEEP]', ...args); }
 function ensureDir(d) { if (!fs.existsSync(d)) fs.mkdirSync(d, { recursive: true }); }
 ensureDir(CACHE_DIR);
 
-// If IG_COOKIE env var provided (base64-encoded netscape format cookies.txt), decode and write to COOKIES_FILE.
-// This runs at process start and will overwrite the existing cookies file if present.
-if (process.env.IG_COOKIE) {
+function readJson(filePath) { try { if (!fs.existsSync(filePath)) return null; return JSON.parse(fs.readFileSync(filePath, 'utf8')); } catch (e) { dbg('readJson error', e && e.message ? e.message : e); return null; } }
+function writeJson(filePath, obj) { try { fs.writeFileSync(filePath, JSON.stringify(obj, null, 2), 'utf8'); } catch (e) { dbg('writeJson error', e && e.message ? e.message : e); } }
+
+function ensureAbsoluteUrl(u) {
+  if (!u) return null;
   try {
-    const decoded = Buffer.from(process.env.IG_COOKIE, 'base64').toString('utf8');
-    if (decoded && decoded.trim()) {
-      // optional: keep a small backup of an existing file
-      try {
-        if (fs.existsSync(COOKIES_FILE)) {
-          const bak = `${COOKIES_FILE}.bak.${Date.now()}`;
-          fs.copyFileSync(COOKIES_FILE, bak);
-          log(`Existing cookies file backed up to ${bak}`);
-        }
-      } catch (e) {
-        // non-fatal
-        log('backup cookies file failed', e && e.message ? e.message : e);
-      }
-
-      // write file with restrictive permission where possible
-      try {
-        fs.writeFileSync(COOKIES_FILE, decoded, { mode: 0o600 });
-      } catch (e) {
-        // fallback if mode unsupported on platform
-        fs.writeFileSync(COOKIES_FILE, decoded);
-      }
-
-      console.log(`IG_COOKIE detected: wrote cookies to ${COOKIES_FILE}`);
-    } else {
-      console.error('IG_COOKIE env var present but decoded content is empty');
-    }
-  } catch (e) {
-    console.error('Failed to decode/write IG_COOKIE env var:', e && e.message ? e.message : e);
-  }
+    if (typeof u !== 'string') u = String(u);
+    if (u.startsWith('//')) return 'https:' + u;
+    if (/^https?:\/\//i.test(u)) return u;
+    if (u.startsWith('/')) return `${BASE}${u}`;
+    return 'https://' + u;
+  } catch (e) { return u; }
 }
+function normalizeUrlStripQuery(u) { try { const o = new URL(u); return o.origin + o.pathname; } catch (e) { return String(u).split('?')[0]; } }
+function tagSafeName(tag) { return tag.replace(/[^a-z0-9_-]/gi, '_').toLowerCase(); }
+function cacheFileForTag(tag) { return path.join(CACHE_DIR, `${tagSafeName(tag)}.json`); }
+function recentFileForTag(tag) { return path.join(CACHE_DIR, `${tagSafeName(tag)}.recent.json`); }
 
-function readJson(filePath) {
+function loadTagCache(tag) {
+  const file = cacheFileForTag(tag);
+  const data = readJson(file);
+  if (!data || !Array.isArray(data.items)) return { items: [], updated_at: 0 };
+  const now = Date.now();
+  const items = data.items.filter(it => it && (!it.ts || (now - it.ts) < (1000 * 60 * 60 * 24))).map(it => ({ id: String(it.id), url: it.url, ts: it.ts || now }));
+  return { items, updated_at: data.updated_at || 0 };
+}
+function saveTagCache(tag, items) {
+  const file = cacheFileForTag(tag);
+  const sanitized = (items || []).map(it => ({ id: String(it.id), url: it.url, ts: it.ts || Date.now() }));
+  writeJson(file, { items: sanitized, updated_at: Date.now() });
+}
+function loadRecentSet(tag) { const file = recentFileForTag(tag); const d = readJson(file); return (d && Array.isArray(d.recent)) ? d.recent : []; }
+function saveRecentSet(tag, arr) { const file = recentFileForTag(tag); writeJson(file, { recent: arr.slice(0, RECENT_MAX) }); }
+
+const inMemoryCache = new Map();
+function getInMemory(tag) { const e = inMemoryCache.get(tag); if (!e) return null; if (Date.now() - e.ts > 60 * 1000) { inMemoryCache.delete(tag); return null; } return e.items; }
+function setInMemory(tag, items) { inMemoryCache.set(tag, { items: items.slice(), ts: Date.now() }); }
+
+function sanitizeForCache(item) {
+  if (!item) return null;
+  const urlCandidate = item.url || item.video_url || item.media_url || item.src || (typeof item === 'string' ? item : null);
+  const url = ensureAbsoluteUrl(urlCandidate);
+  const id = String(item.id || item.pk || item.fbid || (url ? normalizeUrlStripQuery(url) : '') || '');
+  if (!id || !url) return null;
+  return { id, url, ts: Date.now() };
+}
+function mergeIntoCache(tag, fetched) {
   try {
-    if (!fs.existsSync(filePath)) return null;
-    const raw = fs.readFileSync(filePath, 'utf8');
-    return JSON.parse(raw);
-  } catch (e) {
-    console.error('readJson error', e && e.message ? e.message : e);
-    return null;
-  }
-}
-function writeJson(filePath, obj) {
-  try { fs.writeFileSync(filePath, JSON.stringify(obj, null, 2), 'utf8'); } catch (e) { console.error('writeJson error', e && e.message ? e.message : e); }
+    if (!Array.isArray(fetched) || fetched.length === 0) return;
+    const file = cacheFileForTag(tag);
+    const data = readJson(file) || { items: [], updated_at: 0 };
+    const current = Array.isArray(data.items) ? data.items : [];
+    const existingIds = new Set(current.map(i => String(i.id)));
+    for (const f of fetched) {
+      const s = sanitizeForCache(f);
+      if (!s) continue;
+      if (existingIds.has(s.id)) continue;
+      current.push(s);
+      existingIds.add(s.id);
+    }
+    const trimmed = current.slice(-1000);
+    writeJson(file, { items: trimmed, updated_at: Date.now() });
+    setInMemory(tag, trimmed);
+  } catch (e) { console.error('mergeIntoCache error', e && e.message ? e.message : e); }
 }
 
-function parseNetscapeCookies(cookieFileContent) {
-  const lines = cookieFileContent.split(/\r?\n/);
-  const cookies = [];
-  for (const line of lines) {
-    const t = line.trim();
-    if (!t || t.startsWith('#')) continue;
-    const parts = t.split(/\t/);
-    // Netscape cookie format: domain, flag, path, secure, expiration, name, value
-    if (parts.length >= 7) {
-      const domain = parts[0];
-      const pathVal = parts[2] || '/';
-      const secureField = parts[3] || '';
-      const secure = String(secureField).toLowerCase() === 'true' || String(secureField) === '1' || String(secureField) === 'yes';
-      const name = parts[5];
-      const value = parts.slice(6).join('\t'); // value may contain tabs
-      cookies.push({ domain, path: pathVal || '/', name, value, secure: !!secure });
+function chooseBestVideoUrl(media) {
+  if (!media) return null;
+  const pickBest = (arr) => {
+    if (!Array.isArray(arr) || arr.length === 0) return null;
+    let best = arr[0];
+    for (const v of arr) {
+      if ((v.bitrate || v.bandwidth || 0) > (best.bitrate || best.bandwidth || 0)) best = v;
+      else if ((v.width || 0) > (best.width || 0)) best = v;
+    }
+    return best && (best.url || best.src || best[Object.keys(best).find(k => k.includes('url') || k.includes('src'))] || null);
+  };
+  let candidate = pickBest(media.video_versions) || null;
+  if (candidate) return ensureAbsoluteUrl(candidate);
+  if (media.original && media.original.video_versions) {
+    candidate = pickBest(media.original.video_versions);
+    if (candidate) return ensureAbsoluteUrl(candidate);
+  }
+  const carouselCandidates = media.carousel_media || media.carousel_media_items || media.carousel_items || (media.original && (media.original.carousel_media || media.original.carousel_media_items));
+  if (Array.isArray(carouselCandidates) && carouselCandidates.length) {
+    for (const child of carouselCandidates) {
+      const c = chooseBestVideoUrl(child);
+      if (c) return ensureAbsoluteUrl(c);
     }
   }
-  return cookies;
+  const single = media.video_url || media.media_url || media.display_url || (media.image_versions2 && media.image_versions2.candidates && media.image_versions2.candidates[0] && media.image_versions2.candidates[0].url) || null;
+  if (single && String(single).includes('.mp4')) return ensureAbsoluteUrl(single);
+  return null;
 }
 
-function buildAxiosInstanceFromCookies(cookies) {
-  const jar = new tough.CookieJar();
-  for (const c of cookies) {
-    const cookieStr = `${c.name}=${c.value}; Domain=${c.domain}; Path=${c.path || '/'};`;
-    try {
-      // avoid passing unknown options to tough-cookie; keep minimal
-      jar.setCookieSync(cookieStr, BASE);
-      jar.setCookieSync(cookieStr, IOS_BASE);
-    } catch (e) {
-      // ignore individual cookie set errors
+function pickFromCache(tag, n, recentSet) {
+  const cache = loadTagCache(tag).items || [];
+  if (!Array.isArray(cache) || cache.length === 0) return { picked: [], remainingCache: [] };
+  const picked = [];
+  const pickedIds = new Set();
+  const triesLimit = Math.max(50, Math.min(cache.length, n * 12));
+  let tries = 0;
+  while (picked.length < n && tries < triesLimit) {
+    tries++;
+    const idx = Math.floor(Math.random() * cache.length);
+    const it = cache[idx];
+    if (!it) continue;
+    const id = String(it.id || it.url);
+    if (pickedIds.has(id) || (recentSet && recentSet.has(id))) continue;
+    picked.push({ id, url: it.url });
+    pickedIds.add(id);
+  }
+  if (picked.length < n) {
+    for (const it of cache) {
+      const id = String(it.id || it.url);
+      if (pickedIds.has(id) || (recentSet && recentSet.has(id))) continue;
+      picked.push({ id, url: it.url });
+      pickedIds.add(id);
+      if (picked.length >= n) break;
     }
   }
-  const instance = axios.create({
+  return { picked, remainingCache: cache };
+}
+
+// ------------------ No-cookie axios instances ------------------
+function buildNoCookieInstance() {
+  return axios.create({
     baseURL: BASE,
     timeout: 30000,
-    jar,
-    withCredentials: true,
     headers: {
       'User-Agent': DEFAULT_UA,
-      Accept: '*/*',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
       'Accept-Language': 'en-US,en;q=0.9',
       Referer: 'https://www.instagram.com/',
       'X-IG-App-ID': DEFAULT_X_IG_APP_ID
     }
   });
-  return instance;
 }
-
-function buildIosInstanceFromCookies(cookies) {
-  const jar = new tough.CookieJar();
-  for (const c of cookies) {
-    const cookieStr = `${c.name}=${c.value}; Domain=${c.domain}; Path=${c.path || '/'};`;
-    try {
-      jar.setCookieSync(cookieStr, IOS_BASE);
-      jar.setCookieSync(cookieStr, BASE);
-    } catch (e) {
-      // ignore
-    }
-  }
-  const inst = axios.create({
+function buildNoCookieIosInstance() {
+  return axios.create({
     baseURL: IOS_BASE,
     timeout: 30000,
-    jar,
-    withCredentials: true,
     headers: {
       'User-Agent': MOBILE_UA,
       Accept: '*/*',
@@ -158,9 +180,9 @@ function buildIosInstanceFromCookies(cookies) {
       'X-IG-App-ID': DEFAULT_X_IG_APP_ID
     }
   });
-  return inst;
 }
 
+// ------------------ Fetch helpers (no-cookie) ------------------
 async function fetchTopSerp(instance, tag, { searchSessionId, rank_token, next_max_id } = {}) {
   const sid = searchSessionId || uuidv4();
   const params = new URLSearchParams();
@@ -173,174 +195,6 @@ async function fetchTopSerp(instance, tag, { searchSessionId, rank_token, next_m
   return instance.get(url, { headers: { 'X-Requested-With': 'XMLHttpRequest' }, validateStatus: s => s < 500 });
 }
 
-function ensureAbsoluteUrl(u) {
-  if (!u) return null;
-  try {
-    if (typeof u !== 'string') u = String(u);
-    if (u.startsWith('//')) return 'https:' + u;
-    if (/^https?:\/\//i.test(u)) return u;
-    if (u.startsWith('/')) return `${BASE}${u}`;
-    return 'https://' + u;
-  } catch (e) {
-    return u;
-  }
-}
-
-function chooseBestVideoUrl(media) {
-  if (!media) return null;
-
-  const pickBest = (arr) => {
-    if (!Array.isArray(arr) || arr.length === 0) return null;
-    let best = arr[0];
-    for (const v of arr) {
-      if ((v.bitrate || v.bandwidth || 0) > (best.bitrate || best.bandwidth || 0)) best = v;
-      else if ((v.width || 0) > (best.width || 0)) best = v;
-    }
-    return best && (best.url || best.src || best[Object.keys(best).find(k => k.includes('url') || k.includes('src'))] || null);
-  };
-
-  let candidate = pickBest(media.video_versions) || null;
-  if (candidate) return ensureAbsoluteUrl(candidate);
-
-  if (media.original && media.original.video_versions) {
-    candidate = pickBest(media.original.video_versions);
-    if (candidate) return ensureAbsoluteUrl(candidate);
-  }
-
-  const carouselCandidates = media.carousel_media || media.carousel_media_items || media.carousel_items || (media.original && (media.original.carousel_media || media.original.carousel_media_items));
-  if (Array.isArray(carouselCandidates) && carouselCandidates.length) {
-    for (const child of carouselCandidates) {
-      const c = chooseBestVideoUrl(child);
-      if (c) return ensureAbsoluteUrl(c);
-    }
-  }
-
-  const single = media.video_url || media.media_url || media.display_url || (media.image_versions2 && media.image_versions2.candidates && media.image_versions2.candidates[0] && media.image_versions2.candidates[0].url) || null;
-  if (single && String(single).includes('.mp4')) return ensureAbsoluteUrl(single);
-
-  return null;
-}
-
-function normalizeUrlStripQuery(u) {
-  try {
-    const o = new URL(u);
-    return o.origin + o.pathname;
-  } catch (e) {
-    return String(u).split('?')[0];
-  }
-}
-
-function shuffle(arr) { for (let i = arr.length - 1; i > 0; --i) { const j = Math.floor(Math.random() * (i + 1)); [arr[i], arr[j]] = [arr[j], arr[i]]; } return arr; }
-
-// ------------------ Cache file helpers ------------------
-function tagSafeName(tag) { return tag.replace(/[^a-z0-9_-]/gi, '_').toLowerCase(); }
-function cacheFileForTag(tag) { return path.join(CACHE_DIR, `${tagSafeName(tag)}.json`); }
-function recentFileForTag(tag) { return path.join(CACHE_DIR, `${tagSafeName(tag)}.recent.json`); }
-
-function loadTagCache(tag) {
-  // Try in-memory first
-  const mem = getInMemory(tag);
-  if (mem) return { items: mem.slice(), updated_at: Date.now() };
-
-  const file = cacheFileForTag(tag);
-  const data = readJson(file);
-  if (!data || !Array.isArray(data.items)) return { items: [], updated_at: 0 };
-  const now = Date.now();
-  const items = data.items.filter(it => it && (!it.ts || (now - it.ts) < CACHE_TTL_MS)).map(it => ({ id: String(it.id), url: it.url, ts: it.ts || now }));
-  // refresh in-memory hot cache
-  setInMemory(tag, items);
-  return { items, updated_at: data.updated_at || 0 };
-}
-function saveTagCache(tag, items) {
-  // items expected to be array of { id, url, ts } (already sanitized)
-  const file = cacheFileForTag(tag);
-  const sanitized = (items || []).map(it => ({ id: String(it.id), url: it.url, ts: it.ts || Date.now() }));
-  writeJson(file, { items: sanitized, updated_at: Date.now() });
-  setInMemory(tag, sanitized);
-}
-
-function loadRecentSet(tag) { const file = recentFileForTag(tag); const data = readJson(file); if (!data || !Array.isArray(data.recent)) return []; return data.recent; }
-function saveRecentSet(tag, arr) { const file = recentFileForTag(tag); writeJson(file, { recent: arr.slice(0, RECENT_MAX) }); }
-
-// ------------------ In-memory hot cache ------------------
-const inMemoryCache = new Map(); // tag -> { items: Array, ts }
-function getInMemory(tag) {
-  const e = inMemoryCache.get(tag);
-  if (!e) return null;
-  if (Date.now() - e.ts > 60 * 1000) { inMemoryCache.delete(tag); return null; } // 60s TTL
-  return e.items;
-}
-function setInMemory(tag, items) { inMemoryCache.set(tag, { items: items.slice(), ts: Date.now() }); }
-
-// ------------------ Sanitize mergeIntoCache ------------------
-function sanitizeForCache(item) {
-  if (!item) return null;
-  const urlCandidate = item.url || item.video_url || item.media_url || item.src || (typeof item === 'string' ? item : null);
-  const url = ensureAbsoluteUrl(urlCandidate);
-  const id = String(item.id || item.pk || item.fbid || (url ? normalizeUrlStripQuery(url) : '') || '');
-  if (!id || !url) return null;
-  return { id, url, ts: Date.now() };
-}
-
-function mergeIntoCache(tag, fetched) {
-  try {
-    if (!Array.isArray(fetched) || fetched.length === 0) return;
-    const file = cacheFileForTag(tag);
-    const data = readJson(file) || { items: [], updated_at: 0 };
-    const current = Array.isArray(data.items) ? data.items : [];
-    const existingIds = new Set(current.map(i => String(i.id)));
-    const now = Date.now();
-    for (const f of fetched) {
-      const s = sanitizeForCache(f);
-      if (!s) continue;
-      if (existingIds.has(s.id)) continue;
-      current.push(s);
-      existingIds.add(s.id);
-    }
-    const trimmed = current.slice(-1000);
-    writeJson(file, { items: trimmed, updated_at: now });
-    setInMemory(tag, trimmed);
-  } catch (e) {
-    console.error('mergeIntoCache error', e && e.message ? e.message : e);
-  }
-}
-
-// ------------------ Fast pickFromCache ------------------
-function pickFromCache(tag, n, recentSet) {
-  const cache = loadTagCache(tag).items || [];
-  if (!Array.isArray(cache) || cache.length === 0) return { picked: [], remainingCache: [] };
-
-  const picked = [];
-  const pickedIds = new Set();
-  const triesLimit = Math.max(50, Math.min(cache.length, n * 12)); // bound the random probing
-  let tries = 0;
-
-  while (picked.length < n && tries < triesLimit) {
-    tries++;
-    const idx = Math.floor(Math.random() * cache.length);
-    const it = cache[idx];
-    if (!it) continue;
-    const id = String(it.id || it.url);
-    if (pickedIds.has(id) || (recentSet && recentSet.has(id))) continue;
-    picked.push({ id, url: it.url });
-    pickedIds.add(id);
-  }
-
-  // fallback deterministic fill from start
-  if (picked.length < n) {
-    for (const it of cache) {
-      const id = String(it.id || it.url);
-      if (pickedIds.has(id) || (recentSet && recentSet.has(id))) continue;
-      picked.push({ id, url: it.url });
-      pickedIds.add(id);
-      if (picked.length >= n) break;
-    }
-  }
-
-  return { picked, remainingCache: cache };
-}
-
-// ------------------ Fetch helpers (unchanged behavior but robust handling) ------------------
 async function fetchTagSections(instanceI, tag, maxPages = FALLBACK_PAGES) {
   const collected = [];
   try {
@@ -363,33 +217,19 @@ async function fetchTagSections(instanceI, tag, maxPages = FALLBACK_PAGES) {
       if (!any) break;
       await new Promise(r => setTimeout(r, PAGINATION_DELAY_MS));
     }
-  } catch (e) {
-    // ignore
-    log('fetchTagSections error', e && e.message ? e.message : e);
-  }
+  } catch (e) { dbg('fetchTagSections error', e && e.message ? e.message : e); }
   return collected;
 }
 
+// ------------------ Puppeteer fallback (optional) ------------------
 async function puppeteerScrapeTag(tag, desiredCount = 20, maxScrolls = MAX_PUPPETEER_SCROLLS) {
   if (String(process.env.USE_PUPPETEER || 'false').toLowerCase() !== 'true') return [];
   let puppeteer;
-  try { puppeteer = require('puppeteer'); } catch (e) { console.error('Puppeteer not installed but USE_PUPPETEER=true. Install puppeteer to enable scrolling fallback.'); return []; }
-
-  let cookieObjects = [];
-  try {
-    if (fs.existsSync(COOKIES_FILE)) {
-      const raw = fs.readFileSync(COOKIES_FILE, 'utf8');
-      const cookies = parseNetscapeCookies(raw);
-      cookieObjects = cookies.map(c => ({ name: c.name, value: c.value, domain: c.domain.replace(/^\./, ''), path: c.path || '/', httpOnly: false, secure: !!c.secure }));
-    }
-  } catch (e) {}
+  try { puppeteer = require('puppeteer'); } catch (e) { console.error('Puppeteer not installed but USE_PUPPETEER=true. Install puppeteer to enable.'); return []; }
 
   const browser = await puppeteer.launch({ headless: true, args: ['--no-sandbox', '--disable-setuid-sandbox'] });
   const page = await browser.newPage();
   await page.setUserAgent(MOBILE_UA);
-  if (cookieObjects.length) {
-    try { await page.setCookie(...cookieObjects); } catch (e) {}
-  }
 
   const url = `https://www.instagram.com/explore/tags/${encodeURIComponent(tag)}/`;
   await page.goto(url, { waitUntil: 'networkidle2', timeout: 60000 }).catch(()=>{});
@@ -421,7 +261,7 @@ async function puppeteerScrapeTag(tag, desiredCount = 20, maxScrolls = MAX_PUPPE
         const vid = await postPage.evaluate(() => { const vidEl = document.querySelector('article video'); return vidEl ? vidEl.src : null; });
         await postPage.close();
         if (vid) results.push(vid);
-      } catch (e) {}
+      } catch (e) { dbg('puppeteer per-post error', e && e.message ? e.message : e); }
     }
     if (results.length >= desiredCount) break;
   }
@@ -430,8 +270,8 @@ async function puppeteerScrapeTag(tag, desiredCount = 20, maxScrolls = MAX_PUPPE
   return results;
 }
 
-// ------------------ Refill cache from sources (returns minimal fetched array) ------------------
-async function refillCacheFromSources(tag, instance, instanceI, cookies, targetCount) {
+// ------------------ Refill cache using public endpoints (no-cookie) ------------------
+async function refillCacheFromSources(tag, instance, instanceI, targetCount) {
   const fetched = [];
   const seen = new Set();
   let sessionsFetched = 0;
@@ -454,17 +294,17 @@ async function refillCacheFromSources(tag, instance, instanceI, cookies, targetC
     }
   }
 
-  while (fetched.length < targetCount && attempts < MAX_ATTEMPTS && sessionsFetched < MAX_SESSIONS) {
+  while (fetched.length < targetCount && attempts < 8 && sessionsFetched < 6) {
     attempts++;
     const sessionId = uuidv4();
     const rankToken = uuidv4();
     sessionsFetched++;
     let sessionPages = 0;
     let nextMax = null;
-    while (fetched.length < targetCount && sessionPages < (PER_SESSION_PAGES * 2)) {
+    while (fetched.length < targetCount && sessionPages < 8) {
       sessionPages++;
-      let resp;
-      try { resp = await fetchTopSerp(instance, tag, { searchSessionId: sessionId, rank_token: rankToken, next_max_id: nextMax }); } catch (e) { resp = null; }
+      let resp = null;
+      try { resp = await fetchTopSerp(instance, tag, { searchSessionId: sessionId, rank_token: rankToken, next_max_id: nextMax }); } catch (e) { resp = null; dbg('top_serp error', e && e.message ? e.message : e); }
       if (!resp || resp.status !== 200 || !resp.data) break;
       const sections = resp.data.media_grid?.sections || resp.data.sections || resp.data.items || [];
       let got = 0;
@@ -497,7 +337,7 @@ async function refillCacheFromSources(tag, instance, instanceI, cookies, targetC
         }
         if (fetched.length >= targetCount) break;
       }
-    } catch (e) { log('fetchTagSections fallback error', e && e.message ? e.message : e); }
+    } catch (e) { dbg('fetchTagSections fallback error', e && e.message ? e.message : e); }
   }
 
   if (fetched.length < targetCount && String(process.env.USE_PUPPETEER || 'false').toLowerCase() === 'true') {
@@ -508,113 +348,112 @@ async function refillCacheFromSources(tag, instance, instanceI, cookies, targetC
         if (!seen.has(id)) { seen.add(id); fetched.push({ id, url: ensureAbsoluteUrl(s) }); }
         if (fetched.length >= targetCount) break;
       }
-    } catch (e) { log('puppeteerScrapeTag error', e && e.message ? e.message : e); }
+    } catch (e) { dbg('puppeteerScrapeTag error', e && e.message ? e.message : e); }
   }
 
-  // merge only minimal sanitized objects
   try { mergeIntoCache(tag, fetched); } catch (e) { console.error('mergeIntoCache failed', e && e.message ? e.message : e); }
-
   return fetched;
 }
 
-// utility: simple html escape for inserting into the page
-function escapeHtml(s) {
-  if (s == null) return '';
-  return String(s)
-    .replace(/&/g, '&amp;')
-    .replace(/</g, '&lt;')
-    .replace(/>/g, '&gt;')
-    .replace(/"/g, '&quot;')
-    .replace(/'/g, '&#39;');
+// ------------------ Aggressive HTML extraction (backup) ------------------
+function extractFromHtmlAggressive(html, OUT_set, debugPush) {
+  const foundCodes = new Set();
+  try {
+    const $ = cheerio.load(html || '');
+    $('a[href]').each((i, a) => {
+      try { const href = $(a).attr('href') || ''; const m = href.match(/^\/(p|reel|tv)\/([^\/?#]+)\/?/i); if (m && m[2]) foundCodes.add(m[2]); } catch(e){}
+    });
+    $('video').each((i, v) => {
+      try { const src = $(v).attr('src') || $(v).attr('data-src') || $(v).attr('data-video-src'); if (src && String(src).includes('.mp4')) OUT_set.add(ensureAbsoluteUrl(src)); } catch(e){}
+    });
+    const keywords = ['edge_hashtag_to_media', 'shortcode_media', 'shortcode', 'graphql', 'entry_data', 'video_url', 'display_url','og:video'];
+    $('script').each((i, s) => {
+      try {
+        const txt = $(s).html() || '';
+        if (!txt || txt.length < 10) return;
+        const lower = txt.toLowerCase();
+        let matched = false;
+        for (const kw of keywords) { if (lower.includes(kw)) { matched = true; break; } }
+        if (!matched) return;
+        let m;
+        const reShort = /"shortcode"\s*:\s*"([A-Za-z0-9_-]+)"/g;
+        let foundAny = false;
+        while ((m = reShort.exec(txt)) !== null) { foundCodes.add(m[1]); foundAny = true; }
+        const reVideo = /"(?:video_url|video_url_sd|display_url)"\s*:\s*"([^"]+\.mp4[^"]*)"/g;
+        let mv;
+        while ((mv = reVideo.exec(txt)) !== null) { OUT_set.add(ensureAbsoluteUrl(mv[1].replace(/\\u0025/g, '%'))); foundAny = true; }
+        if (!foundAny) {
+          const pos = txt.search(/shortcode|video_url|edge_hashtag_to_media|graphql/i);
+          if (pos !== -1) {
+            // try to find JSON around pos
+            let start = txt.lastIndexOf('{', pos);
+            while (start !== -1) {
+              let depth = 0;
+              let i2 = start;
+              for (; i2 < txt.length; ++i2) {
+                const ch = txt[i2];
+                if (ch === '{') depth++;
+                else if (ch === '}') { depth--; if (depth === 0) break; }
+              }
+              if (i2 > start) {
+                const candidate = txt.slice(start, i2 + 1);
+                try {
+                  const parsed = JSON.parse(candidate);
+                  const sstr = JSON.stringify(parsed);
+                  const reV = /https?:\/\/[^"']+\.mp4[^"']*/g;
+                  let mm;
+                  while ((mm = reV.exec(sstr)) !== null) OUT_set.add(ensureAbsoluteUrl(mm[0]));
+                } catch (e) { /* ignore parse fail */ }
+              }
+              start = txt.lastIndexOf('{', start - 1);
+            }
+          }
+        }
+      } catch (e) {}
+    });
+    const globalRe = /\/(p|reel|tv)\/([A-Za-z0-9_-]{5,})\/?/g;
+    let gm;
+    while ((gm = globalRe.exec(html || '')) !== null) foundCodes.add(gm[2]);
+  } catch (e) {}
+  return Array.from(foundCodes);
 }
 
-// ----------------- Express app -----------------
+// ------------------ Express app & endpoints ------------------
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 app.get('/', (req, res) => {
   const rawTag = (req.query.tag ? String(req.query.tag) : 'kiraedit');
-  const initialTag = escapeHtml(rawTag);
+  const initialTag = (rawTag).replace(/</g, '&lt;').replace(/>/g, '&gt;');
   const autoplay = String(req.query.autoplay || 'false').toLowerCase() === 'true';
-  res.type('html').send(`<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8" />
-<meta name="viewport" content="width=device-width,initial-scale=1" />
-<title>Random IG MP4 player</title>
-<style>
-  body{font-family:system-ui,Segoe UI,Roboto,Helvetica,Arial;margin:18px}
-  .controls{margin-bottom:12px}
-  input[type=text]{padding:6px 8px;width:220px}
-  button{padding:6px 8px;margin-left:6px}
-  .secondary{opacity:0.9}
-  #videos > div{margin:10px 0}
-  video{max-width:100%;height:auto;border:1px solid #ddd}
-  .small{font-size:12px;color:#666}
-  .muted{color:#666}
-  .spinner{display:inline-block;width:12px;height:12px;border:2px solid #ccc;border-top-color:#333;border-radius:50%;animation:spin 1s linear infinite}
-  @keyframes spin{to{transform:rotate(360deg)}}
-</style>
-</head>
-<body>
-<h1>Random Instagram MP4 (uses server cookies)</h1>
-<p>Enter a hashtag (without <code>#</code>) and click <strong>Get</strong>. Server will try several strategies and return random MP4 URLs.</p>
-<div class="controls">
-  <input id="tag" type="text" placeholder="enter tag, e.g. kiraedit" value="${initialTag}" />
-  <button id="go">Get</button>
-  <button id="many" class="secondary">Get 5</button>
-  <button id="refresh" class="secondary" title="Refill results (shuffles)">Shuffle</button>
-  <label class="muted" style="margin-left:8px;"><input id="autoplay" type="checkbox" ${autoplay ? 'checked' : ''} /> autoplay</label>
-</div>
-<div id="info" aria-live="polite"></div>
-<div id="videos"></div>
-<div class="footer"><div class="small">Tips: keep your <code>cookies.txt</code> updated (sessionid + csrftoken). If server returns nothing, check server logs for blocked/403 responses.</div></div>
-<script>
-(function(){
-  const info = document.getElementById('info');
-  const videos = document.getElementById('videos');
-  let lastResults = [];
-  function showInfo(text,busy){ info.innerHTML = text||''; if(busy) info.innerHTML += ' <span class="spinner" aria-hidden="true"></span>'; }
-  function clearVideos(){ videos.innerHTML = ''; }
-  function renderVideos(list, autoplayFlag){ clearVideos(); if(!list||!list.length){ showInfo('No videos found.'); return; } showInfo('Found ' + list.length + ' videos (shuffled).'); lastResults = list.slice(); for(const src of list){ const wrapper = document.createElement('div'); const v = document.createElement('video'); v.controls = true; v.playsInline = true; v.preload = 'metadata'; v.src = src; if(autoplayFlag){ v.autoplay = true; v.muted = true; } wrapper.appendChild(v); videos.appendChild(wrapper); } const first = videos.querySelector('video'); if(first) first.scrollIntoView({ behavior:'smooth', block:'center' }); }
-  async function fetchVideos(count){ const tag = document.getElementById('tag').value.trim(); if(!tag) return alert('Please enter a tag.'); showInfo('Loading... (calling server)', true); clearVideos(); try{ const resp = await fetch('/api/random-videos?tag=' + encodeURIComponent(tag) + '&count=' + Number(count || 1), { cache: 'no-store' }); if(!resp.ok){ const text = await resp.text(); showInfo('Error: ' + resp.status + ' - ' + (text || resp.statusText)); return; } const data = await resp.json(); const list = (data && data.videos) || []; renderVideos(list, document.getElementById('autoplay').checked); }catch(err){ console.error(err); showInfo('Fetch error: ' + err.message); } }
-  document.getElementById('go').addEventListener('click', function(){ fetchVideos(1); });
-  document.getElementById('many').addEventListener('click', function(){ fetchVideos(5); });
-  document.getElementById('refresh').addEventListener('click', function(){ if(lastResults && lastResults.length){ for(let i = lastResults.length - 1; i > 0; --i){ const j = Math.floor(Math.random() * (i + 1)); [lastResults[i], lastResults[j]] = [lastResults[j], lastResults[i]]; } renderVideos(lastResults, document.getElementById('autoplay').checked); } else { fetchVideos(5); } });
-  (function autoMaybe(){ const url = new URL(location.href); if(url.searchParams.get('autoplay') === 'true'){ setTimeout(()=>document.getElementById('go').click(), 300); }})();
-})();
-</script>
-</body>
-</html>`);
+  res.type('html').send(`<!doctype html><html lang="en"><head><meta charset="utf-8"/><meta name="viewport" content="width=device-width,initial-scale=1"/><title>Random IG MP4 (no-login)</title><style>body{font-family:system-ui,Segoe UI,Roboto,Arial;margin:18px;max-width:900px}input[type=text]{padding:8px;width:260px}button{padding:8px 10px;margin-left:8px}.muted{color:#666;font-size:13px}pre{background:#f7f7f7;padding:12px;border:1px solid #eee;white-space:pre-wrap;max-height:360px;overflow:auto}video{max-width:100%;height:auto;margin:8px 0;border:1px solid #ddd}</style></head><body><h1>Random Instagram MP4 (no-login)</h1><p>Enter hashtag (no <code>#</code>) and press <strong>Get</strong>.</p><div><input id="tag" type="text" placeholder="kiraedit" value="${initialTag}"/><input id="count" type="number" value="3" min="1" max="12" style="width:84px;padding:8px"/><label style="margin-left:8px"><input id="autoplay" type="checkbox"${autoplay ? ' checked' : ''}/> autoplay</label><button id="go">Get</button><button id="debugHtml">Get raw HTML (debug)</button></div><div id="info" style="margin-top:12px" class="muted"></div><div id="videos"></div><h3>Debug / Trace</h3><pre id="debug">DEEP_DEBUG logs will appear here (if enabled on server)</pre><script>(async function(){const info=document.getElementById('info');const videos=document.getElementById('videos');const debugEl=document.getElementById('debug');function showInfo(t){info.textContent=t||'';}function clearVideos(){videos.innerHTML='';}function render(list,autoplay){clearVideos();if(!list||!list.length){showInfo('No videos found.');return;}showInfo('Found '+list.length+' video(s).');for(const src of list){const v=document.createElement('video');v.controls=true;v.playsInline=true;v.preload='metadata';v.src=src;if(autoplay){v.autoplay=true;v.muted=true;}videos.appendChild(v);}const first=videos.querySelector('video');if(first)first.scrollIntoView({behavior:'smooth',block:'center'});}async function doFetch(){const tag=document.getElementById('tag').value.trim();const count=Number(document.getElementById('count').value||1);if(!tag)return alert('enter tag');showInfo('Fetching...');clearVideos();debugEl.textContent='';try{const resp=await fetch('/api/random-videos?tag='+encodeURIComponent(tag)+'&count='+count);const data=await resp.json();const arr=(data&&data.videos)?data.videos:[];render(arr,document.getElementById('autoplay').checked);if(data.debug)debugEl.textContent=data.debug.join('\\n\\n');else debugEl.textContent=JSON.stringify(data,null,2);}catch(e){showInfo('Error: '+e.message);debugEl.textContent=e.message;}}async function getRawHtml(){const tag=document.getElementById('tag').value.trim();if(!tag)return alert('enter tag');showInfo('Fetching raw HTML...');try{const resp=await fetch('/api/debug-html?tag='+encodeURIComponent(tag));const txt=await resp.text();document.getElementById('debug').textContent=txt.slice(0,200000)+'\\n\\n[truncated]';}catch(e){document.getElementById('debug').textContent=e.message;}}document.getElementById('go').addEventListener('click',doFetch);document.getElementById('debugHtml').addEventListener('click',getRawHtml);})();</script></body></html>`);
+});
+
+app.get('/api/debug-html', async (req, res) => {
+  try {
+    const rawTag = (req.query.tag || '').trim();
+    if (!rawTag) return res.status(400).send('tag query param required');
+    if (!/^[a-zA-Z0-9_-]{1,80}$/.test(rawTag)) return res.status(400).send('invalid tag');
+    const client = buildNoCookieInstance();
+    const r = await client.get(`/explore/tags/${encodeURIComponent(rawTag)}/`, { validateStatus: s => s < 500 });
+    res.type('html').send(String(r.data || ''));
+  } catch (e) { res.status(500).send('error: ' + (e && e.message ? e.message : String(e))); }
 });
 
 app.get('/api/random-videos', async (req, res) => {
   try {
     const rawTag = (req.query.tag || '').trim();
     if (!rawTag) return res.status(400).json({ error: 'tag query param required' });
-    // Validate tag: allow letters, numbers, underscore, hyphen, up to 80 chars
-    if (!/^[a-zA-Z0-9_-]{1,80}$/.test(rawTag)) {
-      return res.status(400).json({ error: 'invalid tag (only letters, numbers, _ and - allowed, max 80 chars)' });
-    }
+    if (!/^[a-zA-Z0-9_-]{1,80}$/.test(rawTag)) return res.status(400).json({ error: 'invalid tag (only letters, numbers, _ and - allowed, max 80 chars)' });
     const tag = rawTag;
-
     let count = parseInt(req.query.count || '1', 10);
     if (isNaN(count) || count < 1) count = 1;
     if (count > 24) count = 24;
 
-    if (!fs.existsSync(COOKIES_FILE)) {
-      return res.status(500).json({ error: `cookies file missing at ${COOKIES_FILE}` });
-    }
-
-    const raw = fs.readFileSync(COOKIES_FILE, 'utf8');
-    const cookies = parseNetscapeCookies(raw);
-    const instance = buildAxiosInstanceFromCookies(cookies);
-    const instanceI = buildIosInstanceFromCookies(cookies);
-
-    // normalize cookie name matching
-    const csrfC = cookies.find(c => ['csrftoken','csrf_token','csrfmiddlewaretoken'].includes(String(c.name).toLowerCase()));
-    if (csrfC && csrfC.value) { instance.defaults.headers['X-CSRFToken'] = csrfC.value; instanceI.defaults.headers['X-CSRFToken'] = csrfC.value; }
+    // Always use no-cookie instances (no login)
+    const instance = buildNoCookieInstance();
+    const instanceI = buildNoCookieIosInstance();
 
     const recentArr = loadRecentSet(tag) || [];
     const recentSet = new Set(recentArr);
@@ -623,38 +462,30 @@ app.get('/api/random-videos', async (req, res) => {
     let { picked } = pickFromCache(tag, count, recentSet);
 
     const cacheState = loadTagCache(tag);
-    // If cache is small, launch a background big prefetch and do a small immediate fetch
-    if ((!picked || picked.length < count) && cacheState.items.length < CACHE_MIN_SIZE) {
-      log('cache small, launching background prefetch for tag', tag);
-      // background prefetch (don't await)
-      refillCacheFromSources(tag, instance, instanceI, cookies, CACHE_PREFETCH_BATCH)
-        .then(r => log(`background prefetch for [${tag}] returned ${r?.length || 0} items`))
-        .catch(e => console.error('background prefetch error', e && e.message ? e.message : e));
+    if ((!picked || picked.length < count) && cacheState.items.length < 40) {
+      dbg('cache small, launching background prefetch for tag', tag);
+      // background prefetch
+      refillCacheFromSources(tag, instance, instanceI, 80).then(r => dbg(`background prefetch for [${tag}] returned ${r?.length || 0} items`)).catch(e => dbg('background prefetch error', e && e.message ? e.message : e));
 
-      // small synchronous fetch to satisfy this request quickly
       const needNow = Math.max(count - (picked ? picked.length : 0), 6);
       try {
-        log('doing small synchronous fetch needNow=', needNow);
-        const liveFetched = await refillCacheFromSources(tag, instance, instanceI, cookies, needNow);
+        dbg('doing small synchronous fetch needNow=', needNow);
+        const liveFetched = await refillCacheFromSources(tag, instance, instanceI, needNow);
         for (const f of liveFetched) {
           if (!picked) picked = [];
           if (!picked.find(p => p.id === f.id)) picked.push({ id: f.id, url: f.url });
           if (picked.length >= count) break;
         }
-      } catch (e) {
-        console.error('small synchronous fetch failed', e && e.message ? e.message : e);
-      }
+      } catch (e) { dbg('small synchronous fetch failed', e && e.message ? e.message : e); }
     }
 
-    // try to fill from cache if still short
     if (!picked || picked.length < count) {
       const afterPick = pickFromCache(tag, count, recentSet);
       picked = afterPick.picked;
     }
 
-    // if still short, do a live larger fetch (but bounded)
     if (!picked || picked.length < count) {
-      const liveFetched = await refillCacheFromSources(tag, instance, instanceI, cookies, Math.max(count - (picked ? picked.length : 0), 20));
+      const liveFetched = await refillCacheFromSources(tag, instance, instanceI, Math.max(count - (picked ? picked.length : 0), 20));
       for (const f of liveFetched) {
         if (!picked) picked = [];
         if (!picked.find(p => p.id === f.id)) { picked.push({ id: f.id, url: f.url }); }
@@ -662,7 +493,6 @@ app.get('/api/random-videos', async (req, res) => {
       }
     }
 
-    // fallback to all cache items if still nothing
     if (!picked || picked.length < count) {
       const allCache = loadTagCache(tag).items || [];
       for (const it of allCache) {
@@ -672,7 +502,7 @@ app.get('/api/random-videos', async (req, res) => {
       }
     }
 
-    // last-ditch: try one direct top_serp call
+    // last-ditch direct top_serp call (quick)
     if (!picked || picked.length === 0) {
       try {
         const resp = await fetchTopSerp(instance, tag, { searchSessionId: uuidv4() }).catch(() => null);
@@ -693,30 +523,49 @@ app.get('/api/random-videos', async (req, res) => {
             for (const f of found) { if (!picked.find(p => p.id === f.id)) picked.push({ id: f.id, url: f.url }); if (picked.length >= count) break; }
           }
         }
-      } catch (e) { log('direct top_serp fallback error', e && e.message ? e.message : e); }
+      } catch (e) { dbg('direct top_serp fallback error', e && e.message ? e.message : e); }
     }
 
     const urls = (picked || []).map(p => p.url).filter(Boolean).slice(0, count);
     if (!urls.length) {
-      // return 200 with an empty result rather than 204 + body
-      return res.status(200).json({ tag, pagesFetched: 0, totalVideosFound: 0, videos: [], source: 'none' });
+      // try aggressive HTML parse as final fallback
+      try {
+        const htmlResp = await instance.get(`/explore/tags/${encodeURIComponent(tag)}/`, { validateStatus: s => s < 500 });
+        const OUT = new Set();
+        const foundCodes = extractFromHtmlAggressive(String(htmlResp.data || ''), OUT, (k,v)=>dbgDeep(k,v));
+        // attempt per-post fetch for first N shortcodes
+        for (const sc of foundCodes.slice ? foundCodes.slice(0, 8) : foundCodes) {
+          try {
+            const r = await instance.get(`/p/${sc}/`, { validateStatus: s => s < 500 }).catch(()=>null);
+            const html = String(r && r.data ? r.data : '');
+            const og = html.match(/<meta[^>]+property=["']og:video["'][^>]+content=["']([^"']+)["']/i);
+            if (og && og[1]) OUT.add(ensureAbsoluteUrl(og[1]));
+          } catch(e){}
+        }
+        const fallbackUrls = Array.from(OUT).slice(0, count);
+        if (fallbackUrls.length) {
+          // save small cache
+          mergeIntoCache(tag, fallbackUrls.map(u=>({ id: normalizeUrlStripQuery(u), url: u })));
+          for (const u of fallbackUrls) urls.push(u);
+        }
+      } catch (e) { dbg('html fallback error', e && e.message ? e.message : e); }
     }
 
+    if (!urls.length) return res.status(200).json({ tag, pagesFetched: 0, totalVideosFound: 0, videos: [], source: 'none', debug: (DEEP_DEBUG ? ['no results from public endpoints'] : undefined) });
+
+    // update recent set
     const newRecent = recentArr.slice();
     for (const p of picked) { const id = p.id || normalizeUrlStripQuery(p.url); newRecent.unshift(id); }
-    const deduped = [];
-    const seen = new Set();
+    const deduped = []; const seen = new Set();
     for (const id of newRecent) { if (!seen.has(id)) { seen.add(id); deduped.push(id); } if (deduped.length >= RECENT_MAX) break; }
     saveRecentSet(tag, deduped);
 
-    // provide a basic pagesFetched (not exact) and a count of total cached items
     const totalCached = loadTagCache(tag).items.length;
-    res.json({ tag, fetched_at: new Date().toISOString(), pagesFetched: 0, totalVideosFound: totalCached, videos: urls, source: 'cache+live' });
-
+    res.json({ tag, fetched_at: new Date().toISOString(), pagesFetched: 0, totalVideosFound: totalCached, videos: urls, source: 'public_no_cookie', debug: (DEEP_DEBUG ? ['public_no_cookie mode'] : undefined) });
   } catch (err) {
     console.error('API error', err && err.message ? err.message : err);
     res.status(500).json({ error: err && err.message ? err.message : String(err) });
   }
 });
 
-app.listen(PORT, () => { console.log(`topserp-random-server listening on http://localhost:${PORT}/`); });
+app.listen(PORT, () => { console.log(`topserp-no-cookie-server listening on http://localhost:${PORT}/ (DEEP_DEBUG=${DEEP_DEBUG})`); });
