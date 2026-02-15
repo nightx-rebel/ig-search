@@ -92,9 +92,15 @@ function parseNetscapeCookies(cookieFileContent) {
     const t = line.trim();
     if (!t || t.startsWith('#')) continue;
     const parts = t.split(/\t/);
+    // Netscape cookie format: domain, flag, path, secure, expiration, name, value
     if (parts.length >= 7) {
-      const [domain, , pathVal, secure, , name, value] = parts;
-      cookies.push({ domain, path: pathVal || '/', name, value, secure: (String(secure).toLowerCase() === 'true' || secure === 'TRUE') });
+      const domain = parts[0];
+      const pathVal = parts[2] || '/';
+      const secureField = parts[3] || '';
+      const secure = String(secureField).toLowerCase() === 'true' || String(secureField) === '1' || String(secureField) === 'yes';
+      const name = parts[5];
+      const value = parts.slice(6).join('\t'); // value may contain tabs
+      cookies.push({ domain, path: pathVal || '/', name, value, secure: !!secure });
     }
   }
   return cookies;
@@ -105,9 +111,12 @@ function buildAxiosInstanceFromCookies(cookies) {
   for (const c of cookies) {
     const cookieStr = `${c.name}=${c.value}; Domain=${c.domain}; Path=${c.path || '/'};`;
     try {
-      jar.setCookieSync(cookieStr, BASE, { ignoreError: true });
-      jar.setCookieSync(cookieStr, IOS_BASE, { ignoreError: true });
-    } catch (e) {}
+      // avoid passing unknown options to tough-cookie; keep minimal
+      jar.setCookieSync(cookieStr, BASE);
+      jar.setCookieSync(cookieStr, IOS_BASE);
+    } catch (e) {
+      // ignore individual cookie set errors
+    }
   }
   const instance = axios.create({
     baseURL: BASE,
@@ -130,9 +139,11 @@ function buildIosInstanceFromCookies(cookies) {
   for (const c of cookies) {
     const cookieStr = `${c.name}=${c.value}; Domain=${c.domain}; Path=${c.path || '/'};`;
     try {
-      jar.setCookieSync(cookieStr, IOS_BASE, { ignoreError: true });
-      jar.setCookieSync(cookieStr, BASE, { ignoreError: true });
-    } catch (e) {}
+      jar.setCookieSync(cookieStr, IOS_BASE);
+      jar.setCookieSync(cookieStr, BASE);
+    } catch (e) {
+      // ignore
+    }
   }
   const inst = axios.create({
     baseURL: IOS_BASE,
@@ -165,6 +176,7 @@ async function fetchTopSerp(instance, tag, { searchSessionId, rank_token, next_m
 function ensureAbsoluteUrl(u) {
   if (!u) return null;
   try {
+    if (typeof u !== 'string') u = String(u);
     if (u.startsWith('//')) return 'https:' + u;
     if (/^https?:\/\//i.test(u)) return u;
     if (u.startsWith('/')) return `${BASE}${u}`;
@@ -505,13 +517,25 @@ async function refillCacheFromSources(tag, instance, instanceI, cookies, targetC
   return fetched;
 }
 
+// utility: simple html escape for inserting into the page
+function escapeHtml(s) {
+  if (s == null) return '';
+  return String(s)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
 // ----------------- Express app -----------------
 const app = express();
 app.use(cors());
 app.use(express.json());
 
 app.get('/', (req, res) => {
-  const initialTag = req.query.tag ? String(req.query.tag).replace(/"/g, '"') : 'kiraedit';
+  const rawTag = (req.query.tag ? String(req.query.tag) : 'kiraedit');
+  const initialTag = escapeHtml(rawTag);
   const autoplay = String(req.query.autoplay || 'false').toLowerCase() === 'true';
   res.type('html').send(`<!doctype html>
 <html lang="en">
@@ -567,8 +591,14 @@ app.get('/', (req, res) => {
 
 app.get('/api/random-videos', async (req, res) => {
   try {
-    const tag = (req.query.tag || '').trim();
-    if (!tag) return res.status(400).json({ error: 'tag query param required' });
+    const rawTag = (req.query.tag || '').trim();
+    if (!rawTag) return res.status(400).json({ error: 'tag query param required' });
+    // Validate tag: allow letters, numbers, underscore, hyphen, up to 80 chars
+    if (!/^[a-zA-Z0-9_-]{1,80}$/.test(rawTag)) {
+      return res.status(400).json({ error: 'invalid tag (only letters, numbers, _ and - allowed, max 80 chars)' });
+    }
+    const tag = rawTag;
+
     let count = parseInt(req.query.count || '1', 10);
     if (isNaN(count) || count < 1) count = 1;
     if (count > 24) count = 24;
@@ -582,7 +612,8 @@ app.get('/api/random-videos', async (req, res) => {
     const instance = buildAxiosInstanceFromCookies(cookies);
     const instanceI = buildIosInstanceFromCookies(cookies);
 
-    const csrfC = cookies.find(c => ['csrftoken','csrf_token','csrfmiddlewaretoken','CSRFToken'].includes(c.name));
+    // normalize cookie name matching
+    const csrfC = cookies.find(c => ['csrftoken','csrf_token','csrfmiddlewaretoken'].includes(String(c.name).toLowerCase()));
     if (csrfC && csrfC.value) { instance.defaults.headers['X-CSRFToken'] = csrfC.value; instanceI.defaults.headers['X-CSRFToken'] = csrfC.value; }
 
     const recentArr = loadRecentSet(tag) || [];
@@ -667,7 +698,8 @@ app.get('/api/random-videos', async (req, res) => {
 
     const urls = (picked || []).map(p => p.url).filter(Boolean).slice(0, count);
     if (!urls.length) {
-      return res.status(204).json({ tag, pagesFetched: 0, totalVideosFound: 0, videos: [], source: 'none' });
+      // return 200 with an empty result rather than 204 + body
+      return res.status(200).json({ tag, pagesFetched: 0, totalVideosFound: 0, videos: [], source: 'none' });
     }
 
     const newRecent = recentArr.slice();
@@ -677,7 +709,9 @@ app.get('/api/random-videos', async (req, res) => {
     for (const id of newRecent) { if (!seen.has(id)) { seen.add(id); deduped.push(id); } if (deduped.length >= RECENT_MAX) break; }
     saveRecentSet(tag, deduped);
 
-    res.json({ tag, fetched_at: new Date().toISOString(), pagesFetched: null, totalVideosFound: loadTagCache(tag).items.length, videos: urls, source: 'cache+live' });
+    // provide a basic pagesFetched (not exact) and a count of total cached items
+    const totalCached = loadTagCache(tag).items.length;
+    res.json({ tag, fetched_at: new Date().toISOString(), pagesFetched: 0, totalVideosFound: totalCached, videos: urls, source: 'cache+live' });
 
   } catch (err) {
     console.error('API error', err && err.message ? err.message : err);
